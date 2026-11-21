@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/reta-ygs/software-factory/schemas/signal.v1.schema.json",
+  "title": "Software Factory Signal v1",
+  "description": "Normalized, sanitized signal contract between observability producers (e.g. open-observability-framework on Cloudflare) and Software Factory (sf).",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "source",
+    "repo",
+    "kind",
+    "title",
+    "summary",
+    "dedupeKey"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Origin producer name, e.g. open-observability-framework, ci-failure, security-alerts, manual"
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+      "description": "GitHub owner/repo identifier"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["feature", "bugfix", "security", "efficiency", "proposal"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"],
+      "default": "medium"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string"
+    },
+    "evidence": {
+      "type": "object",
+      "description": "Sanitized diagnostic metadata only; never raw secrets or bulk raw logs.",
+      "additionalProperties": true
+    },
+    "dedupeKey": {
+      "type": "string",
+      "minLength": 1
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ackUrl": {
+      "type": "string",
+      "description": "Optional callback/ack endpoint (used by Cloudflare Signal Queue sensor)"
+    }
+  },
+  "additionalProperties": true
+}

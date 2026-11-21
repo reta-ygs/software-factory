@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "software-factory"
+version = "0.1.0"
+description = "Autonomous software factory orchestrator for coding environments using herdr-core"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.scripts]
+sf = "software_factory.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

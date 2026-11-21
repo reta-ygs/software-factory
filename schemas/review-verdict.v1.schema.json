@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/reta-ygs/software-factory/schemas/review-verdict.v1.schema.json",
+  "title": "Software Factory Independent Review Verdict v1",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "verdict",
+    "behaviorImpact",
+    "summary",
+    "findings"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "request-changes", "escalate-human"]
+    },
+    "behaviorImpact": {
+      "type": "string",
+      "enum": ["none", "low", "medium", "high"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "message"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warning", "error"]
+          },
+          "path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}
