@@ -51,8 +51,31 @@
     },
     "evidence": {
       "type": "object",
-      "description": "Sanitized diagnostic metadata only; never raw secrets or bulk raw logs.",
+      "description": "Sanitized diagnostic metadata and optional queryRefs; never raw secrets or bulk raw logs.",
+      "properties": {
+        "queryRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "url"],
+            "properties": {
+              "id": { "type": "string" },
+              "label": { "type": "string" },
+              "url": { "type": "string" }
+            }
+          }
+        }
+      },
       "additionalProperties": true
+    },
+    "recoveryCheck": {
+      "type": "object",
+      "description": "Optional post-deploy recovery verification endpoint on open-observability-framework.",
+      "required": ["queryUrl"],
+      "properties": {
+        "queryUrl": { "type": "string" },
+        "waitMinutes": { "type": "number", "minimum": 0, "default": 30 }
+      }
     },
     "dedupeKey": {
       "type": "string",

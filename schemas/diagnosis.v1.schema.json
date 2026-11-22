@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/reta-ygs/software-factory/schemas/diagnosis.v1.schema.json",
+  "title": "Software Factory Pre-Fix Diagnosis v1",
+  "description": "Root-cause diagnosis and false-positive backtest output produced before authoring a fix.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "status",
+    "rootCause",
+    "backtestSummary"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["confirmed", "false-positive", "inconclusive"]
+    },
+    "rootCause": {
+      "type": "string",
+      "minLength": 1
+    },
+    "backtestSummary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suspectedCommit": {
+      "type": ["string", "null"]
+    },
+    "proposedFixScope": {
+      "type": "string"
+    },
+    "evidenceRefs": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

@@ -54,6 +54,8 @@
             postInstall = ''
               install -Dm644 schemas/signal.v1.schema.json "$out/share/software-factory/schemas/signal.v1.schema.json"
               install -Dm644 schemas/review-verdict.v1.schema.json "$out/share/software-factory/schemas/review-verdict.v1.schema.json"
+              install -Dm644 schemas/diagnosis.v1.schema.json "$out/share/software-factory/schemas/diagnosis.v1.schema.json"
+              install -Dm644 schemas/diagnosis-challenge.v1.schema.json "$out/share/software-factory/schemas/diagnosis-challenge.v1.schema.json"
             '';
 
             meta = with pkgs.lib; {

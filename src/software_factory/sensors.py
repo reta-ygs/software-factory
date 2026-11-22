@@ -54,6 +54,51 @@ def pull_cloudflare_signal_queue(cfg: dict[str, Any]) -> list[Signal]:
     return signals
 
 
+def _resolve_same_origin_url(endpoint: str, ref_or_url: str, *, default_prefix: str = "/v1/queries/") -> str:
+    base = endpoint.rstrip("/")
+    if not base:
+        raise ValueError("signalQueue.endpoint is not configured")
+    parsed_base = urllib.parse.urlparse(base)
+    if ref_or_url.startswith(("http://", "https://")):
+        parsed_target = urllib.parse.urlparse(ref_or_url)
+        if (parsed_target.scheme, parsed_target.netloc) != (parsed_base.scheme, parsed_base.netloc):
+            raise ValueError(
+                f"Refusing cross-origin request to {parsed_target.netloc}; expected {parsed_base.netloc}"
+            )
+        return ref_or_url
+    if ref_or_url.startswith("/"):
+        return f"{base}{ref_or_url}"
+    encoded = urllib.parse.quote(ref_or_url, safe="")
+    return f"{base}{default_prefix}{encoded}"
+
+
+def fetch_cloudflare_query(cfg: dict[str, Any], ref_or_url: str) -> Any:
+    """Fetch a read-only sanitized telemetry query reference from open-observability-framework."""
+    sq = cfg.get("signalQueue") or {}
+    endpoint = str(sq.get("endpoint") or "").rstrip("/")
+    url = _resolve_same_origin_url(endpoint, ref_or_url, default_prefix="/v1/queries/")
+    timeout = int(sq.get("timeoutSeconds") or 20)
+    headers = load_cf_access_headers(sq.get("credentialsFile"))
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_recovery_status(cfg: dict[str, Any], query_url: str) -> dict[str, Any]:
+    """Check post-deploy recovery metrics from open-observability-framework."""
+    sq = cfg.get("signalQueue") or {}
+    endpoint = str(sq.get("endpoint") or "").rstrip("/")
+    url = _resolve_same_origin_url(endpoint, query_url, default_prefix="/v1/recovery/")
+    timeout = int(sq.get("timeoutSeconds") or 20)
+    headers = load_cf_access_headers(sq.get("credentialsFile"))
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Recovery check response must be a JSON object")
+    return data
+
+
 def ack_cloudflare_signal(
     cfg: dict[str, Any],
     signal_dict: dict[str, Any],

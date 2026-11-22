@@ -17,7 +17,15 @@ from typing import Any, Iterator
 from software_factory.config import effective_repo_policy, get_state_dir
 from software_factory.models import RunRecord, Signal, utc_now_iso
 
-ACTIVE_RUN_STATUSES = {"running", "reviewing", "human_review"}
+ACTIVE_RUN_STATUSES = {
+    "investigating",
+    "diagnosis_review",
+    "running",
+    "reviewing",
+    "verifying_recovery",
+    "human_review",
+}
+DIAGNOSIS_KINDS = {"bugfix", "efficiency"}
 
 
 def _env_bin(env_name: str, default: str) -> str:
@@ -71,7 +79,7 @@ class StateStore:
     def list_runs(self) -> list[RunRecord]:
         records: list[RunRecord] = []
         for path in sorted(self.runs_dir.glob("*.json")):
-            if path.name.endswith(".verdict.json"):
+            if path.name.count(".") > 1:
                 continue
             try:
                 records.append(RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8"))))
@@ -86,7 +94,11 @@ class StateStore:
         return None
 
     def count_running(self) -> int:
-        return sum(1 for r in self.list_runs() if r.status in {"running", "reviewing"})
+        return sum(
+            1
+            for r in self.list_runs()
+            if r.status in {"investigating", "diagnosis_review", "running", "reviewing"}
+        )
 
 
 def hc_list_terminals() -> list[dict[str, Any]]:
@@ -159,7 +171,78 @@ def prepare_isolated_workdir(
     return workdir
 
 
-def build_worker_prompt(signal: Signal, *, repo_policy: dict[str, Any], branch: str, base_branch: str) -> str:
+def _query_refs_hint(evidence: dict[str, Any]) -> str:
+    refs = evidence.get("queryRefs")
+    if not isinstance(refs, list) or not refs:
+        return ""
+    lines = [
+        "",
+        "Telemetry Query References (use `sf query <id-or-url>` to fetch sanitized aggregates on demand):",
+    ]
+    for ref in refs:
+        if isinstance(ref, dict) and ref.get("id"):
+            label = f" - {ref.get('label')}" if ref.get("label") else ""
+            url = ref.get("url") or ref.get("id")
+            lines.append(f"- `{ref['id']}` (`{url}`){label}")
+    return "\n".join(lines) + "\n"
+
+
+def build_diagnosis_prompt(
+    signal: Signal,
+    *,
+    diagnosis_path: Path,
+    base_branch: str,
+) -> str:
+    evidence_json = json.dumps(signal.evidence, indent=2, ensure_ascii=False)
+    qhint = _query_refs_hint(signal.evidence)
+    return f"""You are a Software Factory forensic investigator for `{signal.repo}` (branch `{base_branch}`).
+
+Your role in this phase is STRICTLY READ-ONLY investigation and false-positive backtesting.
+Do NOT edit repository files, commit, push, or open a PR yet.
+
+Signal metadata:
+- ID: {signal.id}
+- Source: {signal.source}
+- Kind: {signal.kind}
+- Severity: {signal.severity}
+- Title: {signal.title}
+
+Summary:
+{signal.summary}
+
+Evidence (sanitized):
+```json
+{evidence_json}
+```
+{qhint}
+Steps:
+1. Backtest the timeline against `git log` / recent commits and available telemetry (`sf query <ref>` if listed) to determine whether this is a genuine code regression/defect OR a false positive caused by traffic mix shifts, external outages, or transient noise.
+2. Identify the concrete root cause and minimal fix scope if confirmed.
+3. Write ONLY a valid JSON file to `{diagnosis_path}` matching this exact schema:
+```json
+{{
+  "schemaVersion": 1,
+  "status": "confirmed | false-positive | inconclusive",
+  "rootCause": "Concrete root cause explanation or why it is a false positive",
+  "backtestSummary": "How timeline/commits/metrics confirm or rule out a code regression",
+  "suspectedCommit": "optional commit sha or null",
+  "proposedFixScope": "Minimal files/changes needed if confirmed",
+  "evidenceRefs": ["optional queryRef ids inspected"]
+}}
+```
+"""
+
+
+def build_worker_prompt(
+    signal: Signal,
+    *,
+    repo_policy: dict[str, Any],
+    branch: str,
+    base_branch: str,
+    diagnosis: dict[str, Any] | None = None,
+    challenge: dict[str, Any] | None = None,
+    followup_comments: list[dict[str, Any]] | None = None,
+) -> str:
     test_hint = (
         f"Run the repository test command: `{repo_policy['testCommand']}`."
         if repo_policy.get("testCommand")
@@ -171,6 +254,24 @@ def build_worker_prompt(signal: Signal, *, repo_policy: dict[str, Any], branch: 
         else "Do NOT merge the PR yourself; the Software Factory controller will run mechanical risk checks and an independent reviewer before any auto-merge."
     )
     evidence_json = json.dumps(signal.evidence, indent=2, ensure_ascii=False)
+    qhint = _query_refs_hint(signal.evidence)
+    diag_block = ""
+    if diagnosis:
+        diag_block += f"\nVerified Diagnosis:\n```json\n{json.dumps(diagnosis, indent=2, ensure_ascii=False)}\n```\n"
+    if challenge:
+        diag_block += f"\nAdversarial Diagnosis Review:\n```json\n{json.dumps(challenge, indent=2, ensure_ascii=False)}\n```\n"
+    if followup_comments:
+        diag_block += (
+            "\nHuman PR Review Comments to Address:\n```json\n"
+            + json.dumps(followup_comments, indent=2, ensure_ascii=False)
+            + "\n```\n"
+        )
+
+    pr_step = (
+        f"4. Commit your updates on branch `{branch}` and push to `origin` to update the existing PR."
+        if followup_comments
+        else f"4. Commit your changes on branch `{branch}`, push to `origin`, and open a Pull Request against `{base_branch}` using `gh pr create` with a clear summary of changes, verification results, and expected behavioral impact."
+    )
     return f"""You are a Software Factory worker executing an isolated task on branch `{branch}` (base `{base_branch}`) for `{signal.repo}`.
 
 Signal metadata:
@@ -188,12 +289,12 @@ Evidence (sanitized):
 ```json
 {evidence_json}
 ```
-
+{qhint}{diag_block}
 Instructions:
 1. Investigate the codebase in this isolated checkout and implement the smallest clean, well-tested fix or feature addressing the signal.
 2. Never read or touch checkouts outside this working directory. Never commit secrets, tokens, or credentials. Never run `nixos-rebuild switch` or restart host services.
 3. {test_hint}
-4. Commit your changes on branch `{branch}`, push to `origin`, and open a Pull Request against `{base_branch}` using `gh pr create` with a clear summary of changes, verification results, and expected behavioral impact.
+{pr_step}
 5. {merge_rule}
 """
 
@@ -274,6 +375,7 @@ def dispatch_signal(
     signal: Signal,
     *,
     dry_run: bool = False,
+    skip_diagnosis: bool = False,
 ) -> dict[str, Any]:
     existing = store.find_active_by_dedupe(signal.dedupe_key)
     if existing:
@@ -303,11 +405,17 @@ def dispatch_signal(
     run_id = f"{ts}-{dedupe_tag[:8]}"
     branch = f"sf/{signal.kind}/{dedupe_tag}-{slug}"
     worker_agent = str(policy.get("workerAgent") or "agy")
-    session_name = f"sf-{run_id}"
+    needs_diagnosis = (
+        not skip_diagnosis
+        and bool(policy.get("requireDiagnosis", True))
+        and signal.kind in DIAGNOSIS_KINDS
+    )
+    session_name = f"sf-diag-{run_id}" if needs_diagnosis else f"sf-{run_id}"
 
     if dry_run:
         return {
             "action": "dry-run",
+            "phase": "investigating" if needs_diagnosis else "running",
             "runId": run_id,
             "repo": signal.repo,
             "kind": signal.kind,
@@ -324,6 +432,46 @@ def dispatch_signal(
         base_branch=policy["defaultBranch"],
         branch=branch,
     )
+
+    if needs_diagnosis:
+        diagnosis_path = store.runs_dir / f"{run_id}.diagnosis.json"
+        prompt = build_diagnosis_prompt(
+            signal,
+            diagnosis_path=diagnosis_path,
+            base_branch=policy["defaultBranch"],
+        )
+        launch_info = launch_agent_session(
+            agent=worker_agent,
+            session_name=session_name,
+            workdir=workdir,
+            prompt=prompt,
+        )
+        record = RunRecord(
+            run_id=run_id,
+            repo=signal.repo,
+            branch=branch,
+            base_branch=policy["defaultBranch"],
+            workdir=str(workdir),
+            worker_agent=worker_agent,
+            worker_session=f"sf-{run_id}",
+            diagnosis_session=session_name,
+            diagnosis_path=str(diagnosis_path),
+            signal=signal.to_dict(),
+            status="investigating",
+        )
+        store.save_run(record)
+        return {
+            "action": "investigating",
+            "runId": run_id,
+            "repo": signal.repo,
+            "kind": signal.kind,
+            "branch": branch,
+            "workerAgent": worker_agent,
+            "sessionName": session_name,
+            "diagnosisPath": str(diagnosis_path),
+            "launch": launch_info,
+        }
+
     prompt = build_worker_prompt(
         signal,
         repo_policy=policy,

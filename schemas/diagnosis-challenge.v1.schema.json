@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/reta-ygs/software-factory/schemas/diagnosis-challenge.v1.schema.json",
+  "title": "Software Factory Adversarial Diagnosis Challenge v1",
+  "description": "Independent adversarial check attempting to disprove the primary agent's root-cause diagnosis.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "verdict",
+    "summary",
+    "counterArguments"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["confirmed", "disproved", "escalate-human"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "counterArguments": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

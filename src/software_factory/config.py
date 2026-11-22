@@ -46,6 +46,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "workerAgent": "agy",
         "reviewerAgent": "codex",
         "maxConcurrentRuns": 2,
+        "requireDiagnosis": True,
+        "recoveryWaitMinutes": 30,
         "autoMerge": {
             "enabled": False,
             "mergeMethod": "squash",
@@ -124,7 +126,14 @@ def find_repo_config(cfg: dict[str, Any], repo: str) -> dict[str, Any] | None:
 def effective_repo_policy(cfg: dict[str, Any], repo: str) -> dict[str, Any]:
     defaults = copy.deepcopy(cfg.get("defaults", DEFAULT_CONFIG["defaults"]))
     repo_cfg = find_repo_config(cfg, repo) or {}
-    merged = deep_merge(defaults, {k: v for k, v in repo_cfg.items() if k in ("workerAgent", "reviewerAgent", "autoMerge")})
+    merged = deep_merge(
+        defaults,
+        {
+            k: v
+            for k, v in repo_cfg.items()
+            if k in ("workerAgent", "reviewerAgent", "autoMerge", "requireDiagnosis", "recoveryWaitMinutes")
+        },
+    )
     merged["repo"] = repo
     merged["gitUrl"] = repo_cfg.get("gitUrl") or f"git@github.com:{repo}.git"
     merged["defaultBranch"] = repo_cfg.get("defaultBranch") or "main"

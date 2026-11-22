@@ -1,7 +1,8 @@
-"""Reconciliation loop: PR detection, mechanical risk check, independent review, and gated auto-merge."""
+"""Reconciliation loop: diagnosis challenge, PR review, gated auto-merge, PR comment wakeup, and post-deploy recovery check."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import subprocess
@@ -9,20 +10,56 @@ from pathlib import Path
 from typing import Any
 
 from software_factory.config import choose_reviewer_agent, effective_repo_policy
-from software_factory.models import ReviewVerdict, RiskReport, RunRecord
+from software_factory.models import (
+    DiagnosisChallenge,
+    DiagnosisReport,
+    ReviewVerdict,
+    RiskReport,
+    RunRecord,
+    Signal,
+    parse_utc_iso,
+    utc_now_iso,
+)
 from software_factory.risk import evaluate_risk, parse_git_numstat
 from software_factory.runner import (
     StateStore,
+    build_worker_prompt,
     hc_list_terminals,
     hc_terminal_state,
     is_terminal_working,
     launch_agent_session,
 )
-from software_factory.sensors import ack_cloudflare_signal
+from software_factory.sensors import ack_cloudflare_signal, fetch_recovery_status
 
 
 def _env_bin(env_name: str, default: str) -> str:
     return os.environ.get(env_name) or default
+
+
+def _maybe_ack(
+    cfg: dict[str, Any],
+    record: RunRecord,
+    *,
+    status: str,
+    reason: str | None = None,
+    force: bool = False,
+) -> None:
+    if not record.signal.get("ackUrl"):
+        return
+    if record.signal_acked and not force:
+        return
+    try:
+        record.signal_acked = ack_cloudflare_signal(
+            cfg,
+            record.signal,
+            status=status,
+            run_id=record.run_id,
+            pr_url=record.pr_url,
+            reason=reason,
+        )
+    except Exception:
+        if not force:
+            record.signal_acked = False
 
 
 def find_open_pr(repo: str, branch: str) -> dict[str, Any] | None:
@@ -49,6 +86,55 @@ def find_open_pr(repo: str, branch: str) -> dict[str, Any] | None:
         return None
     prs = json.loads(proc.stdout or "[]")
     return prs[0] if prs else None
+
+
+def fetch_new_human_pr_comments(
+    repo: str,
+    pr_number: int,
+    last_handled_id: str | None,
+) -> list[dict[str, Any]]:
+    """Poll issue & review comments on an open PR to wake up a sleeping worker."""
+    gh_bin = _env_bin("SF_GH_BIN", "gh")
+    collected: list[dict[str, Any]] = []
+    for endpoint in (
+        f"repos/{repo}/issues/{pr_number}/comments",
+        f"repos/{repo}/pulls/{pr_number}/comments",
+    ):
+        proc = subprocess.run(
+            [gh_bin, "api", endpoint],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            continue
+        items = json.loads(proc.stdout)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            body = str(item.get("body") or "").strip()
+            if not body or body.startswith("## Software Factory:"):
+                continue
+            cid = str(item.get("id") or "")
+            if not cid:
+                continue
+            collected.append(
+                {
+                    "id": cid,
+                    "author": (item.get("user") or {}).get("login", "unknown"),
+                    "body": body,
+                    "path": item.get("path"),
+                    "createdAt": item.get("created_at") or "",
+                }
+            )
+
+    collected.sort(key=lambda c: (c["createdAt"], c["id"]))
+    if not last_handled_id:
+        return collected
+    for idx, c in enumerate(collected):
+        if c["id"] == last_handled_id:
+            return collected[idx + 1 :]
+    return collected
 
 
 def compute_run_risk(cfg: dict[str, Any], record: RunRecord) -> RiskReport:
@@ -96,6 +182,41 @@ def compute_run_risk(cfg: dict[str, Any], record: RunRecord) -> RiskReport:
     )
 
 
+def build_diagnosis_challenge_prompt(
+    record: RunRecord,
+    diagnosis: DiagnosisReport,
+    challenge_path: Path,
+) -> str:
+    return f"""You are an independent adversarial challenger for `{record.repo}` (run `{record.run_id}`).
+
+Your sole job is to TRY TO DISPROVE the primary investigator's root-cause diagnosis before any code is modified.
+Do NOT edit repository files, commit, push, or open a PR.
+
+Original signal:
+```json
+{json.dumps(record.signal, indent=2, ensure_ascii=False)}
+```
+
+Primary diagnosis to challenge:
+```json
+{json.dumps(diagnosis.to_dict(), indent=2, ensure_ascii=False)}
+```
+
+Steps:
+1. Check whether the claimed root cause is actually supported by code paths, git history, and telemetry (`sf query <ref>` if available).
+2. Actively look for confirmation bias: could this be a traffic mix shift, external dependency hiccup, caching effect, or a different code path?
+3. Write ONLY a valid JSON file to `{challenge_path}` matching this exact schema:
+```json
+{{
+  "schemaVersion": 1,
+  "verdict": "confirmed | disproved | escalate-human",
+  "summary": "Why the diagnosis survived scrutiny or was disproved",
+  "counterArguments": ["Specific alternative hypotheses or counter-evidence checked"]
+}}
+```
+"""
+
+
 def build_reviewer_prompt(
     record: RunRecord,
     risk_report: RiskReport,
@@ -138,6 +259,140 @@ Steps:
 """
 
 
+def _advance_investigating(
+    cfg: dict[str, Any],
+    store: StateStore,
+    record: RunRecord,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    if not record.diagnosis_path:
+        return None
+    dpath = Path(record.diagnosis_path)
+    if not dpath.exists():
+        return None
+    diagnosis = DiagnosisReport.from_dict(json.loads(dpath.read_text(encoding="utf-8")))
+
+    if diagnosis.status == "false-positive":
+        if dry_run:
+            return {"action": "dry-run-dismiss", "runId": record.run_id, "reason": diagnosis.backtest_summary}
+        record.diagnosis_report = diagnosis.to_dict()
+        record.status = "dismissed"
+        record.decision_reason = f"False positive ruled out by backtest: {diagnosis.backtest_summary}"
+        _maybe_ack(cfg, record, status="dismissed", reason=record.decision_reason)
+        store.save_run(record)
+        return {"action": "dismissed", "runId": record.run_id, "reason": record.decision_reason}
+
+    if diagnosis.status == "inconclusive":
+        if dry_run:
+            return {"action": "dry-run-escalate-diagnosis", "runId": record.run_id}
+        record.diagnosis_report = diagnosis.to_dict()
+        record.status = "human_review"
+        record.decision_reason = f"Diagnosis inconclusive: {diagnosis.root_cause}"
+        _maybe_ack(cfg, record, status="human_review", reason=record.decision_reason)
+        store.save_run(record)
+        return {"action": "human_review", "runId": record.run_id, "reason": record.decision_reason}
+
+    # Confirmed diagnosis -> launch independent adversarial challenger to try to disprove it
+    policy = effective_repo_policy(cfg, record.repo)
+    challenger_agent = choose_reviewer_agent(record.worker_agent, policy.get("reviewerAgent"))
+    challenger_session = f"sf-chal-{record.run_id}"
+    challenge_path = store.runs_dir / f"{record.run_id}.diagnosis-challenge.json"
+
+    if dry_run:
+        return {
+            "action": "dry-run-diagnosis-challenge",
+            "runId": record.run_id,
+            "challengerAgent": challenger_agent,
+        }
+
+    prompt = build_diagnosis_challenge_prompt(record, diagnosis, challenge_path)
+    launch_info = launch_agent_session(
+        agent=challenger_agent,
+        session_name=challenger_session,
+        workdir=Path(record.workdir),
+        prompt=prompt,
+    )
+    record.diagnosis_report = diagnosis.to_dict()
+    record.reviewer_agent = challenger_agent
+    record.diagnosis_reviewer_session = challenger_session
+    record.diagnosis_challenge_path = str(challenge_path)
+    record.status = "diagnosis_review"
+    store.save_run(record)
+    return {
+        "action": "diagnosis-challenge-started",
+        "runId": record.run_id,
+        "challengerAgent": challenger_agent,
+        "challengePath": str(challenge_path),
+        "launch": launch_info,
+    }
+
+
+def _advance_diagnosis_review(
+    cfg: dict[str, Any],
+    store: StateStore,
+    record: RunRecord,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    if not record.diagnosis_challenge_path:
+        return None
+    cpath = Path(record.diagnosis_challenge_path)
+    if not cpath.exists():
+        return None
+    challenge = DiagnosisChallenge.from_dict(json.loads(cpath.read_text(encoding="utf-8")))
+
+    if challenge.verdict == "disproved":
+        if dry_run:
+            return {"action": "dry-run-disproved", "runId": record.run_id}
+        record.diagnosis_challenge = challenge.to_dict()
+        record.status = "dismissed"
+        record.decision_reason = f"Diagnosis disproved by adversarial review: {challenge.summary}"
+        _maybe_ack(cfg, record, status="dismissed", reason=record.decision_reason)
+        store.save_run(record)
+        return {"action": "dismissed", "runId": record.run_id, "reason": record.decision_reason}
+
+    if challenge.verdict == "escalate-human":
+        if dry_run:
+            return {"action": "dry-run-escalate-human", "runId": record.run_id}
+        record.diagnosis_challenge = challenge.to_dict()
+        record.status = "human_review"
+        record.decision_reason = f"Diagnosis challenge escalated to human: {challenge.summary}"
+        _maybe_ack(cfg, record, status="human_review", reason=record.decision_reason)
+        store.save_run(record)
+        return {"action": "human_review", "runId": record.run_id, "reason": record.decision_reason}
+
+    # Diagnosis survived adversarial scrutiny -> launch implementation worker!
+    policy = effective_repo_policy(cfg, record.repo)
+    signal = Signal.from_dict(record.signal)
+    if dry_run:
+        return {"action": "dry-run-implement", "runId": record.run_id}
+
+    prompt = build_worker_prompt(
+        signal,
+        repo_policy=policy,
+        branch=record.branch,
+        base_branch=record.base_branch,
+        diagnosis=record.diagnosis_report,
+        challenge=challenge.to_dict(),
+    )
+    launch_info = launch_agent_session(
+        agent=record.worker_agent,
+        session_name=record.worker_session,
+        workdir=Path(record.workdir),
+        prompt=prompt,
+    )
+    record.diagnosis_challenge = challenge.to_dict()
+    record.status = "running"
+    store.save_run(record)
+    return {
+        "action": "implementation-started",
+        "runId": record.run_id,
+        "workerSession": record.worker_session,
+        "launch": launch_info,
+    }
+
+
 def start_independent_review(
     cfg: dict[str, Any],
     store: StateStore,
@@ -148,8 +403,9 @@ def start_independent_review(
     policy = effective_repo_policy(cfg, record.repo)
     risk_report = compute_run_risk(cfg, record)
     reviewer_agent = choose_reviewer_agent(record.worker_agent, policy.get("reviewerAgent"))
-    reviewer_session = f"sf-rev-{record.run_id}"
-    verdict_path = store.runs_dir / f"{record.run_id}.verdict.json"
+    suffix = f"-{record.wakeup_count}" if record.wakeup_count else ""
+    reviewer_session = f"sf-rev-{record.run_id}{suffix}"
+    verdict_path = store.runs_dir / f"{record.run_id}{suffix}.verdict.json"
 
     if dry_run:
         return {
@@ -208,7 +464,7 @@ def _format_decision_comment(
         f"- **Mechanical Risk**: `{risk_report.level}` (files: {risk_report.files_changed}, +{risk_report.lines_added}/-{risk_report.lines_deleted})",
         f"- **Independent Review**: verdict=`{verdict.verdict}`, behaviorImpact=`{verdict.behavior_impact}`",
         "",
-        f"### Review Summary",
+        "### Review Summary",
         verdict.summary,
     ]
     if risk_report.reasons:
@@ -248,11 +504,14 @@ def apply_review_verdict(
         and verdict.behavior_impact in ("none", "low")
     )
 
+    has_recovery = bool((record.signal.get("recoveryCheck") or {}).get("queryUrl"))
+
     if dry_run:
+        next_state = ("verifying_recovery" if has_recovery else "auto_merged") if can_auto_merge else "human_review"
         return {
             "action": "dry-run-decision",
             "runId": record.run_id,
-            "decision": "auto_merged" if can_auto_merge else "human_review",
+            "decision": next_state,
             "risk": risk_report.to_dict(),
             "verdict": verdict.to_dict(),
         }
@@ -282,7 +541,8 @@ def apply_review_verdict(
             text=True,
             check=True,
         )
-        record.status = "auto_merged"
+        record.merged_at = utc_now_iso()
+        record.status = "verifying_recovery" if has_recovery else "auto_merged"
         record.decision_reason = "Passed mechanical low-risk check and independent review approval."
     else:
         _gh_ensure_label(gh_bin, record.repo, "sf:needs-human-review", "d93f0b", "Requires human approval")
@@ -308,20 +568,7 @@ def apply_review_verdict(
 
     record.risk_report = risk_report.to_dict()
     record.review_verdict = verdict.to_dict()
-
-    if not record.signal_acked and record.signal.get("ackUrl"):
-        try:
-            record.signal_acked = ack_cloudflare_signal(
-                cfg,
-                record.signal,
-                status=record.status,
-                run_id=record.run_id,
-                pr_url=record.pr_url,
-                reason=record.decision_reason,
-            )
-        except Exception:
-            record.signal_acked = False
-
+    _maybe_ack(cfg, record, status=record.status, reason=record.decision_reason)
     store.save_run(record)
     return {
         "action": record.status,
@@ -329,6 +576,133 @@ def apply_review_verdict(
         "prNumber": record.pr_number,
         "prUrl": record.pr_url,
         "reason": record.decision_reason,
+    }
+
+
+def _advance_verifying_recovery(
+    cfg: dict[str, Any],
+    store: StateStore,
+    record: RunRecord,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    rc = record.signal.get("recoveryCheck") or {}
+    query_url = rc.get("queryUrl")
+    if not query_url:
+        return None
+    policy = effective_repo_policy(cfg, record.repo)
+    wait_min = float(rc.get("waitMinutes", policy.get("recoveryWaitMinutes", 30)))
+    if record.merged_at:
+        elapsed_min = (datetime.now(timezone.utc) - parse_utc_iso(record.merged_at)).total_seconds() / 60.0
+        if elapsed_min < wait_min:
+            return None
+
+    result = fetch_recovery_status(cfg, str(query_url))
+    recovered = bool(result.get("recovered"))
+    summary = str(result.get("summary") or ("Metrics returned to baseline." if recovered else "Metrics have not recovered."))
+
+    if dry_run:
+        return {"action": "dry-run-recovery", "runId": record.run_id, "recovered": recovered, "summary": summary}
+
+    gh_bin = _env_bin("SF_GH_BIN", "gh")
+    record.recovery_result = result
+    if recovered:
+        record.status = "resolved"
+        record.decision_reason = f"Post-deploy recovery verified: {summary}"
+        if record.pr_number:
+            subprocess.run(
+                [
+                    gh_bin,
+                    "pr",
+                    "comment",
+                    str(record.pr_number),
+                    "--repo",
+                    record.repo,
+                    "--body",
+                    f"## Software Factory: Post-deploy recovery verified\n\n{summary}\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        _maybe_ack(cfg, record, status="resolved", reason=record.decision_reason, force=True)
+    else:
+        record.status = "human_review"
+        record.decision_reason = f"Post-deploy recovery check failed: {summary}"
+        if record.pr_number:
+            _gh_ensure_label(gh_bin, record.repo, "sf:recovery-failed", "b60205", "Post-deploy recovery check failed")
+            subprocess.run(
+                [gh_bin, "pr", "edit", str(record.pr_number), "--repo", record.repo, "--add-label", "sf:recovery-failed"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            subprocess.run(
+                [
+                    gh_bin,
+                    "pr",
+                    "comment",
+                    str(record.pr_number),
+                    "--repo",
+                    record.repo,
+                    "--body",
+                    f"## Software Factory: Recovery verification failed\n\n{summary}\n",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        _maybe_ack(cfg, record, status="recovery_failed", reason=record.decision_reason, force=True)
+
+    store.save_run(record)
+    return {"action": record.status, "runId": record.run_id, "recovered": recovered, "summary": summary}
+
+
+def _maybe_wakeup_from_pr_comments(
+    cfg: dict[str, Any],
+    store: StateStore,
+    record: RunRecord,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    if not record.pr_number:
+        return None
+    new_comments = fetch_new_human_pr_comments(record.repo, record.pr_number, record.last_handled_comment_id)
+    if not new_comments:
+        return None
+    latest_id = new_comments[-1]["id"]
+    if dry_run:
+        return {"action": "dry-run-wakeup", "runId": record.run_id, "commentCount": len(new_comments)}
+
+    policy = effective_repo_policy(cfg, record.repo)
+    signal = Signal.from_dict(record.signal)
+    record.wakeup_count += 1
+    session_name = f"sf-fix-{record.run_id}-{record.wakeup_count}"
+    prompt = build_worker_prompt(
+        signal,
+        repo_policy=policy,
+        branch=record.branch,
+        base_branch=record.base_branch,
+        diagnosis=record.diagnosis_report,
+        challenge=record.diagnosis_challenge,
+        followup_comments=new_comments,
+    )
+    launch_info = launch_agent_session(
+        agent=record.worker_agent,
+        session_name=session_name,
+        workdir=Path(record.workdir),
+        prompt=prompt,
+    )
+    record.worker_session = session_name
+    record.last_handled_comment_id = latest_id
+    record.status = "running"
+    store.save_run(record)
+    return {
+        "action": "wakeup-from-pr-comment",
+        "runId": record.run_id,
+        "commentCount": len(new_comments),
+        "workerSession": session_name,
+        "launch": launch_info,
     }
 
 
@@ -342,7 +716,15 @@ def reconcile_runs(
     terminals = hc_list_terminals()
 
     for record in store.list_runs():
-        if record.status == "running":
+        if record.status == "investigating":
+            res = _advance_investigating(cfg, store, record, dry_run=dry_run)
+            if res:
+                results.append(res)
+        elif record.status == "diagnosis_review":
+            res = _advance_diagnosis_review(cfg, store, record, dry_run=dry_run)
+            if res:
+                results.append(res)
+        elif record.status == "running":
             worker_entry = hc_terminal_state(record.worker_session, terminals)
             if is_terminal_working(worker_entry):
                 continue
@@ -363,5 +745,13 @@ def reconcile_runs(
             raw_verdict = json.loads(vpath.read_text(encoding="utf-8"))
             verdict = ReviewVerdict.from_dict(raw_verdict)
             results.append(apply_review_verdict(cfg, store, record, verdict, dry_run=dry_run))
+        elif record.status == "verifying_recovery":
+            res = _advance_verifying_recovery(cfg, store, record, dry_run=dry_run)
+            if res:
+                results.append(res)
+        elif record.status == "human_review":
+            res = _maybe_wakeup_from_pr_comments(cfg, store, record, dry_run=dry_run)
+            if res:
+                results.append(res)
 
     return results

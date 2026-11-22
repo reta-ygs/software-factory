@@ -28,6 +28,7 @@ from software_factory.reconcile import (
 from software_factory.runner import StateStore, dispatch_signal
 from software_factory.sensors import (
     collect_repo_signals,
+    fetch_cloudflare_query,
     parse_signals_text,
     pull_cloudflare_signal_queue,
 )
@@ -123,8 +124,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
         if not acquired:
             _print_json({"action": "skipped", "reason": "dispatch lock held"})
             return 0
-        res = dispatch_signal(cfg, store, signal, dry_run=args.dry_run)
+        res = dispatch_signal(cfg, store, signal, dry_run=args.dry_run, skip_diagnosis=args.skip_diagnosis)
     _print_json(res)
+    return 0
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    data = fetch_cloudflare_query(cfg, args.ref)
+    _print_json(data)
     return 0
 
 
@@ -296,8 +304,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_submit.add_argument("--prompt", default="")
     p_submit.add_argument("--spec", default="", help="Path to a spec markdown file")
     p_submit.add_argument("--dedupe-key", default="")
+    p_submit.add_argument("--skip-diagnosis", action="store_true", help="Skip pre-fix diagnosis & challenge phase")
     p_submit.add_argument("--dry-run", action="store_true")
     p_submit.set_defaults(func=cmd_submit)
+
+    p_query = sub.add_parser("query", help="Fetch a read-only sanitized telemetry queryRef from Cloudflare")
+    p_query.add_argument("ref", help="Query reference ID or same-origin URL")
+    p_query.set_defaults(func=cmd_query)
 
     p_ingest = sub.add_parser("ingest", help="Ingest Signal JSON from file or stdin")
     p_ingest.add_argument("file", nargs="?", default="-")

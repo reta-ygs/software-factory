@@ -7,7 +7,6 @@ import io
 import json
 import os
 import shutil
-import stat
 import subprocess
 import tempfile
 import threading
@@ -17,8 +16,9 @@ from pathlib import Path
 
 from software_factory.cli import main
 from software_factory.config import DEFAULT_CONFIG, choose_reviewer_agent, load_cf_access_headers
-from software_factory.models import DiffStat, ReviewVerdict, Signal
+from software_factory.models import DiffStat
 from software_factory.risk import evaluate_risk, parse_git_numstat
+from software_factory.sensors import fetch_cloudflare_query
 
 
 class RiskEvaluationTests(unittest.TestCase):
@@ -97,6 +97,16 @@ class CredentialsTests(unittest.TestCase):
             self.assertEqual(headers["CF-Access-Client-Id"], "id-123")
             self.assertEqual(headers["CF-Access-Client-Secret"], "sec-456")
 
+    def test_cross_origin_query_ref_rejected(self):
+        cfg = {
+            "signalQueue": {
+                "enabled": True,
+                "endpoint": "https://oof.example.workers.dev",
+            }
+        }
+        with self.assertRaises(ValueError):
+            fetch_cloudflare_query(cfg, "https://evil.example.com/v1/queries/q-1")
+
 
 class EndToEndWorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -109,7 +119,6 @@ class EndToEndWorkflowTests(unittest.TestCase):
         self.hc_log = self.root / "hc.log"
         self.gh_log = self.root / "gh.log"
 
-        # Create a real local bare git repo fixture
         self.src_repo = self.root / "src-repo"
         self.src_repo.mkdir()
         self._git(self.src_repo, "init", "-b", "main")
@@ -126,7 +135,6 @@ class EndToEndWorkflowTests(unittest.TestCase):
 
         bash_bin = shutil.which("bash") or "/bin/sh"
 
-        # Mock hc
         self.mock_hc = self.bin_dir / "mock-hc"
         self.mock_hc.write_text(
             f"""#!{bash_bin}
@@ -146,7 +154,6 @@ exit 0
         )
         os.chmod(self.mock_hc, 0o755)
 
-        # Mock gh
         self.mock_gh = self.bin_dir / "mock-gh"
         self.mock_gh.write_text(
             f"""#!{bash_bin}
@@ -155,6 +162,18 @@ printf '%s\\n' "$*" >> "{self.gh_log}"
 if [[ "${{1:-}}" == "pr" && "${{2:-}}" == "list" ]]; then
   printf '%s\\n' "${{MOCK_GH_PR_LIST:-[]}}"
   exit 0
+fi
+if [[ "${{1:-}}" == "api" ]]; then
+  case "${{2:-}}" in
+    *issues/*/comments)
+      printf '%s\\n' "${{MOCK_GH_ISSUE_COMMENTS:-[]}}"
+      exit 0
+      ;;
+    *pulls/*/comments)
+      printf '%s\\n' "${{MOCK_GH_REVIEW_COMMENTS:-[]}}"
+      exit 0
+      ;;
+  esac
 fi
 exit 0
 """,
@@ -169,6 +188,8 @@ exit 0
         os.environ["SF_GH_BIN"] = str(self.mock_gh)
         os.environ["MOCK_HC_LS"] = "[]"
         os.environ["MOCK_GH_PR_LIST"] = "[]"
+        os.environ["MOCK_GH_ISSUE_COMMENTS"] = "[]"
+        os.environ["MOCK_GH_REVIEW_COMMENTS"] = "[]"
 
     def tearDown(self):
         os.environ.clear()
@@ -185,7 +206,7 @@ exit 0
         self.assertEqual(rc, 0)
         return json.loads(buf.getvalue())
 
-    def test_cloudflare_pull_reconcile_auto_merge_and_ack(self):
+    def test_full_closed_loop_diagnosis_challenge_automerge_and_recovery(self):
         acks: list[dict] = []
         auth_headers_seen: list[tuple[str | None, str | None]] = []
 
@@ -200,7 +221,16 @@ exit 0
                     "severity": "high",
                     "title": "Fix subtraction typo in add()",
                     "summary": "Error spike in /calc",
-                    "evidence": {"errorRate": 0.05},
+                    "evidence": {
+                        "errorRate": 0.05,
+                        "queryRefs": [
+                            {"id": "q-1", "label": "5xx rate by route", "url": "/v1/queries/q-1"}
+                        ],
+                    },
+                    "recoveryCheck": {
+                        "queryUrl": "/v1/recovery/sig-cf-1",
+                        "waitMinutes": 0,
+                    },
                     "dedupeKey": "oof:demo:add-bug",
                 }
             ]
@@ -214,7 +244,16 @@ exit 0
                 auth_headers_seen.append(
                     (self.headers.get("CF-Access-Client-Id"), self.headers.get("CF-Access-Client-Secret"))
                 )
-                body = json.dumps(signal_payload).encode()
+                if self.path.startswith("/v1/signals"):
+                    body = json.dumps(signal_payload).encode()
+                elif self.path == "/v1/queries/q-1":
+                    body = json.dumps({"route": "/calc", "p99Ms": 420, "errorRate": 0.05}).encode()
+                elif self.path == "/v1/recovery/sig-cf-1":
+                    body = json.dumps({"recovered": True, "summary": "Error rate dropped from 5% to 0.05%"}).encode()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -252,18 +291,57 @@ exit 0
                 "--auto-merge",
             )
 
-            # 1. Patrol pulls signal from Cloudflare Signal Queue and dispatches worker
+            # Query-reference helper works with CF Access auth
+            q_res = self._run_cli("query", "q-1")
+            self.assertEqual(q_res["route"], "/calc")
+
+            # 1. Patrol pulls bugfix signal -> starts pre-fix investigation
             patrol_res = self._run_cli("patrol")
             self.assertEqual(patrol_res["signalsFound"], 1)
-            self.assertEqual(patrol_res["results"][0]["action"], "dispatched")
+            self.assertEqual(patrol_res["results"][0]["action"], "investigating")
             run_id = patrol_res["results"][0]["runId"]
             self.assertEqual(auth_headers_seen[0], ("cid", "csec"))
 
-            # Second patrol deduplicates the active run
+            # Second patrol deduplicates active investigating run
             patrol_res2 = self._run_cli("patrol")
             self.assertEqual(patrol_res2["results"][0]["action"], "skipped")
 
-            # Simulate worker making a small bugfix commit and pushing branch
+            # 2. Primary investigator writes confirmed diagnosis -> reconcile launches adversarial challenger
+            run_detail = self._run_cli("status", run_id)
+            Path(run_detail["diagnosis_path"]).write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "status": "confirmed",
+                        "rootCause": "add() subtracts b instead of adding",
+                        "backtestSummary": "Error spike started immediately after initial commit; traffic unchanged.",
+                        "proposedFixScope": "app.py line 2",
+                        "evidenceRefs": ["q-1"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rec_chal = self._run_cli("reconcile")
+            self.assertEqual(rec_chal["actions"][0]["action"], "diagnosis-challenge-started")
+            self.assertEqual(rec_chal["actions"][0]["challengerAgent"], "codex")
+
+            # 3. Adversarial challenger confirms diagnosis -> reconcile launches implementation worker
+            run_detail = self._run_cli("status", run_id)
+            Path(run_detail["diagnosis_challenge_path"]).write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "verdict": "confirmed",
+                        "summary": "Verified subtraction operator bug; no alternative traffic explanation.",
+                        "counterArguments": ["Checked traffic mix via q-1; steady."],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rec_impl = self._run_cli("reconcile")
+            self.assertEqual(rec_impl["actions"][0]["action"], "implementation-started")
+
+            # Worker commits fix and pushes branch
             run_detail = self._run_cli("status", run_id)
             workdir = Path(run_detail["workdir"])
             self._git(workdir, "config", "user.name", "Worker")
@@ -274,7 +352,7 @@ exit 0
             self._git(workdir, "commit", "-m", "fix add")
             self._git(workdir, "push", "-u", "origin", run_detail["branch"])
 
-            # 2. Reconcile detects open PR and launches independent codex reviewer
+            # 4. Reconcile detects PR -> launches independent PR reviewer
             os.environ["MOCK_GH_PR_LIST"] = json.dumps(
                 [
                     {
@@ -285,11 +363,10 @@ exit 0
                     }
                 ]
             )
-            rec1 = self._run_cli("reconcile")
-            self.assertEqual(rec1["actions"][0]["action"], "review-started")
-            self.assertEqual(rec1["actions"][0]["reviewerAgent"], "codex")
+            rec_rev = self._run_cli("reconcile")
+            self.assertEqual(rec_rev["actions"][0]["action"], "review-started")
 
-            # 3. Independent reviewer writes approve + low impact verdict -> auto-merge & ack
+            # 5. Reviewer approves with low impact -> auto-merge & enters verifying_recovery
             run_detail = self._run_cli("status", run_id)
             Path(run_detail["verdict_path"]).write_text(
                 json.dumps(
@@ -303,20 +380,80 @@ exit 0
                 ),
                 encoding="utf-8",
             )
-            rec2 = self._run_cli("reconcile")
-            self.assertEqual(rec2["actions"][0]["action"], "auto_merged")
+            rec_merge = self._run_cli("reconcile")
+            self.assertEqual(rec_merge["actions"][0]["action"], "verifying_recovery")
+
+            # 6. Post-deploy recovery check passes -> resolved & acked
+            rec_recov = self._run_cli("reconcile")
+            self.assertEqual(rec_recov["actions"][0]["action"], "resolved")
+            self.assertTrue(rec_recov["actions"][0]["recovered"])
 
             gh_calls = self.gh_log.read_text(encoding="utf-8")
             self.assertIn("pr merge 42 --repo reta-ygs/demo --auto --squash", gh_calls)
             self.assertIn("--add-label sf:auto-merge", gh_calls)
-            self.assertEqual(len(acks), 1)
-            self.assertEqual(acks[0]["status"], "auto_merged")
-            self.assertEqual(acks[0]["prUrl"], "https://github.com/reta-ygs/demo/pull/42")
+            self.assertIn("Post-deploy recovery verified", gh_calls)
+            self.assertEqual(acks[-1]["status"], "resolved")
         finally:
             server.shutdown()
             server.server_close()
 
-    def test_feature_submit_always_escalates_to_human_review(self):
+    def test_false_positive_and_disproved_diagnosis_dismiss_without_pr(self):
+        self._run_cli("init")
+        self._run_cli("repo", "add", "reta-ygs/demo", "--git-url", str(self.bare_repo), "--auto-merge")
+
+        # Case A: primary investigator rules false-positive
+        res_a = self._run_cli(
+            "submit", "--repo", "reta-ygs/demo", "--kind", "bugfix", "--title", "Transient latency spike"
+        )
+        self.assertEqual(res_a["action"], "investigating")
+        run_a = self._run_cli("status", res_a["runId"])
+        Path(run_a["diagnosis_path"]).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "status": "false-positive",
+                    "rootCause": "Traffic surge from bot crawl",
+                    "backtestSummary": "No code deploy in 48h; p99 correlated 1:1 with RPS spike.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        rec_a = self._run_cli("reconcile")
+        self.assertEqual(rec_a["actions"][0]["action"], "dismissed")
+
+        # Case B: adversarial challenger disproves diagnosis
+        res_b = self._run_cli(
+            "submit", "--repo", "reta-ygs/demo", "--kind", "efficiency", "--title", "Suspected N+1 query"
+        )
+        run_b = self._run_cli("status", res_b["runId"])
+        Path(run_b["diagnosis_path"]).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "status": "confirmed",
+                    "rootCause": "Suspected N+1 query in loader",
+                    "backtestSummary": "Latency increased on /list.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._run_cli("reconcile")
+        run_b = self._run_cli("status", res_b["runId"])
+        Path(run_b["diagnosis_challenge_path"]).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "verdict": "disproved",
+                    "summary": "Loader already batches via DataLoader; latency was upstream DB maintenance.",
+                    "counterArguments": ["Verified SQL count = 1 per request."],
+                }
+            ),
+            encoding="utf-8",
+        )
+        rec_b = self._run_cli("reconcile")
+        self.assertEqual(rec_b["actions"][0]["action"], "dismissed")
+
+    def test_feature_human_review_and_pr_comment_wakeup(self):
         self._run_cli("init")
         self._run_cli(
             "repo",
@@ -364,7 +501,6 @@ exit 0
         )
         self._run_cli("reconcile")
         run_detail = self._run_cli("status", run_id)
-        # Even if reviewer approves with low impact, mechanical gate blocks feature auto-merge!
         Path(run_detail["verdict_path"]).write_text(
             json.dumps(
                 {
@@ -382,6 +518,27 @@ exit 0
         gh_calls = self.gh_log.read_text(encoding="utf-8")
         self.assertIn("--add-label sf:needs-human-review", gh_calls)
         self.assertNotIn("pr merge 99", gh_calls)
+
+        # Software Factory's own comment must NOT trigger a wakeup
+        os.environ["MOCK_GH_ISSUE_COMMENTS"] = json.dumps(
+            [{"id": 1001, "user": {"login": "bot"}, "body": "## Software Factory: Human review required\n...", "created_at": "2026-11-22T00:00:00Z"}]
+        )
+        rec_noop = self._run_cli("reconcile")
+        self.assertEqual(rec_noop["actions"], [])
+
+        # Human posts a review comment -> reconcile wakes up worker!
+        os.environ["MOCK_GH_ISSUE_COMMENTS"] = json.dumps(
+            [
+                {"id": 1001, "user": {"login": "bot"}, "body": "## Software Factory: Human review required\n...", "created_at": "2026-11-22T00:00:00Z"},
+                {"id": 1002, "user": {"login": "reta"}, "body": "Please add a docstring and unit test for mul().", "created_at": "2026-11-22T00:05:00Z"},
+            ]
+        )
+        rec_wake = self._run_cli("reconcile")
+        self.assertEqual(rec_wake["actions"][0]["action"], "wakeup-from-pr-comment")
+        self.assertEqual(rec_wake["actions"][0]["commentCount"], 1)
+        run_after = self._run_cli("status", run_id)
+        self.assertEqual(run_after["status"], "running")
+        self.assertEqual(run_after["last_handled_comment_id"], "1002")
 
 
 if __name__ == "__main__":
