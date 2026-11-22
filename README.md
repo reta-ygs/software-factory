@@ -1,6 +1,6 @@
 # Software Factory (`sf`)
 
-`coding` 環境（`herdr-core` + `agy` / `codex` / `pi` + `gh`）向けの自律ソフトウェアファクトリー・オーケストレーターです。
+`herdr-core` + `agy` / `codex` / `pi` + `gh` 向けの自律ソフトウェアファクトリー・オーケストレーターです。
 
 ## 設計方針
 

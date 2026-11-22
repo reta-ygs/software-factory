@@ -192,7 +192,10 @@ def load_cf_access_headers(credentials_file: str | None) -> dict[str, str]:
     client_secret = client_secret or os.environ.get("CF_ACCESS_CLIENT_SECRET", "")
     bearer = bearer or os.environ.get("SF_SIGNAL_QUEUE_TOKEN", "")
 
-    headers: dict[str, str] = {"Accept": "application/json"}
+    headers: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": "software-factory/0.1",
+    }
     if client_id and client_secret:
         headers["CF-Access-Client-Id"] = client_id
         headers["CF-Access-Client-Secret"] = client_secret

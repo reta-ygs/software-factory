@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "software-factory"
 version = "0.1.0"
-description = "Autonomous software factory orchestrator for coding environments using herdr-core"
+description = "Autonomous software factory orchestrator for herdr-core environments"
 readme = "README.md"
 requires-python = ">=3.11"
 

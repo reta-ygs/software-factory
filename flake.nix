@@ -1,5 +1,5 @@
 {
-  description = "Autonomous Software Factory orchestrator (sf) for herdr-core coding environments";
+  description = "Autonomous Software Factory orchestrator (sf) for herdr-core environments";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

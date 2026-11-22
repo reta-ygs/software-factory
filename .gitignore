@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 result
 result-*
+cloudflare/wrangler.jsonc
+cloudflare/cloudflare.jsonc
+cloudflare/cloudflare.config.ts
+cloudflare/.wrangler/
+cloudflare/.cloudflare/
+cloudflare/node_modules/
