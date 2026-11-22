@@ -22,6 +22,7 @@ ACTIVE_RUN_STATUSES = {
     "diagnosis_review",
     "running",
     "reviewing",
+    "pending_merge",
     "verifying_recovery",
     "human_review",
 }

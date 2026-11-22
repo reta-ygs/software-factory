@@ -48,6 +48,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "maxConcurrentRuns": 2,
         "requireDiagnosis": True,
         "recoveryWaitMinutes": 30,
+        "allowedCommentAssociations": ["OWNER", "MEMBER", "COLLABORATOR"],
+        "allowedCommentAuthors": [],
         "autoMerge": {
             "enabled": False,
             "mergeMethod": "squash",
@@ -131,7 +133,16 @@ def effective_repo_policy(cfg: dict[str, Any], repo: str) -> dict[str, Any]:
         {
             k: v
             for k, v in repo_cfg.items()
-            if k in ("workerAgent", "reviewerAgent", "autoMerge", "requireDiagnosis", "recoveryWaitMinutes")
+            if k
+            in (
+                "workerAgent",
+                "reviewerAgent",
+                "autoMerge",
+                "requireDiagnosis",
+                "recoveryWaitMinutes",
+                "allowedCommentAssociations",
+                "allowedCommentAuthors",
+            )
         },
     )
     merged["repo"] = repo

@@ -182,7 +182,7 @@ def cmd_patrol(args: argparse.Namespace) -> int:
                 continue
             policy = effective_repo_policy(cfg, repo_name)
             try:
-                signals.extend(collect_repo_signals(policy, store.root))
+                signals.extend(collect_repo_signals(policy, store.root, dry_run=args.dry_run))
             except Exception as exc:
                 errors.append(f"{repo_name}: {exc}")
 

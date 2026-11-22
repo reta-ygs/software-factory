@@ -88,13 +88,45 @@ def find_open_pr(repo: str, branch: str) -> dict[str, Any] | None:
     return prs[0] if prs else None
 
 
+def get_pr_merge_status(repo: str, pr_number: int) -> dict[str, Any] | None:
+    gh_bin = _env_bin("SF_GH_BIN", "gh")
+    proc = subprocess.run(
+        [
+            gh_bin,
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--json",
+            "state,mergedAt",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    data = json.loads(proc.stdout)
+    return data if isinstance(data, dict) else None
+
+
 def fetch_new_human_pr_comments(
     repo: str,
     pr_number: int,
     last_handled_id: str | None,
+    *,
+    allowed_associations: list[str] | None = None,
+    allowed_authors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Poll issue & review comments on an open PR to wake up a sleeping worker."""
+    """Poll authorized maintainer comments on an open PR to wake up a sleeping worker."""
     gh_bin = _env_bin("SF_GH_BIN", "gh")
+    permitted_assocs = {
+        str(a).upper()
+        for a in (allowed_associations if allowed_associations is not None else ["OWNER", "MEMBER", "COLLABORATOR"])
+    }
+    permitted_authors = {str(a).lower() for a in (allowed_authors or []) if str(a).strip()}
+
     collected: list[dict[str, Any]] = []
     for endpoint in (
         f"repos/{repo}/issues/{pr_number}/comments",
@@ -115,13 +147,24 @@ def fetch_new_human_pr_comments(
             body = str(item.get("body") or "").strip()
             if not body or body.startswith("## Software Factory:"):
                 continue
+            user = item.get("user") or {}
+            login = str(user.get("login") or "").strip()
+            user_type = str(user.get("type") or "")
+            if not login or user_type == "Bot" or login.endswith("[bot]"):
+                continue
+            assoc = str(item.get("author_association") or "").upper()
+            if assoc not in permitted_assocs:
+                continue
+            if permitted_authors and login.lower() not in permitted_authors:
+                continue
             cid = str(item.get("id") or "")
             if not cid:
                 continue
             collected.append(
                 {
                     "id": cid,
-                    "author": (item.get("user") or {}).get("login", "unknown"),
+                    "author": login,
+                    "authorAssociation": assoc,
                     "body": body,
                     "path": item.get("path"),
                     "createdAt": item.get("created_at") or "",
@@ -504,10 +547,8 @@ def apply_review_verdict(
         and verdict.behavior_impact in ("none", "low")
     )
 
-    has_recovery = bool((record.signal.get("recoveryCheck") or {}).get("queryUrl"))
-
     if dry_run:
-        next_state = ("verifying_recovery" if has_recovery else "auto_merged") if can_auto_merge else "human_review"
+        next_state = "pending_merge" if can_auto_merge else "human_review"
         return {
             "action": "dry-run-decision",
             "runId": record.run_id,
@@ -541,9 +582,9 @@ def apply_review_verdict(
             text=True,
             check=True,
         )
-        record.merged_at = utc_now_iso()
-        record.status = "verifying_recovery" if has_recovery else "auto_merged"
-        record.decision_reason = "Passed mechanical low-risk check and independent review approval."
+        record.merged_at = None
+        record.status = "pending_merge"
+        record.decision_reason = "Passed mechanical low-risk check and independent review approval; waiting for GitHub merge."
     else:
         _gh_ensure_label(gh_bin, record.repo, "sf:needs-human-review", "d93f0b", "Requires human approval")
         subprocess.run(
@@ -577,6 +618,47 @@ def apply_review_verdict(
         "prUrl": record.pr_url,
         "reason": record.decision_reason,
     }
+
+
+def _advance_pending_merge(
+    cfg: dict[str, Any],
+    store: StateStore,
+    record: RunRecord,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    if not record.pr_number:
+        return None
+    pr_status = get_pr_merge_status(record.repo, record.pr_number)
+    if not pr_status:
+        return None
+    state = str(pr_status.get("state") or "").upper()
+    if state == "OPEN":
+        return None
+    if state == "CLOSED":
+        if dry_run:
+            return {"action": "dry-run-closed", "runId": record.run_id}
+        record.status = "closed"
+        record.decision_reason = "PR was closed without merging."
+        _maybe_ack(cfg, record, status="closed", reason=record.decision_reason, force=True)
+        store.save_run(record)
+        return {"action": "closed", "runId": record.run_id}
+    if state != "MERGED":
+        return None
+
+    merged_at = str(pr_status.get("mergedAt") or "").strip() or utc_now_iso()
+    has_recovery = bool((record.signal.get("recoveryCheck") or {}).get("queryUrl"))
+    next_status = "verifying_recovery" if has_recovery else "auto_merged"
+    if dry_run:
+        return {"action": f"dry-run-{next_status}", "runId": record.run_id, "mergedAt": merged_at}
+
+    record.merged_at = merged_at
+    record.status = next_status
+    record.decision_reason = "PR merged on GitHub."
+    if not has_recovery:
+        _maybe_ack(cfg, record, status="auto_merged", reason=record.decision_reason, force=True)
+    store.save_run(record)
+    return {"action": next_status, "runId": record.run_id, "mergedAt": merged_at}
 
 
 def _advance_verifying_recovery(
@@ -667,14 +749,20 @@ def _maybe_wakeup_from_pr_comments(
 ) -> dict[str, Any] | None:
     if not record.pr_number:
         return None
-    new_comments = fetch_new_human_pr_comments(record.repo, record.pr_number, record.last_handled_comment_id)
+    policy = effective_repo_policy(cfg, record.repo)
+    new_comments = fetch_new_human_pr_comments(
+        record.repo,
+        record.pr_number,
+        record.last_handled_comment_id,
+        allowed_associations=policy.get("allowedCommentAssociations"),
+        allowed_authors=policy.get("allowedCommentAuthors"),
+    )
     if not new_comments:
         return None
     latest_id = new_comments[-1]["id"]
     if dry_run:
         return {"action": "dry-run-wakeup", "runId": record.run_id, "commentCount": len(new_comments)}
 
-    policy = effective_repo_policy(cfg, record.repo)
     signal = Signal.from_dict(record.signal)
     record.wakeup_count += 1
     session_name = f"sf-fix-{record.run_id}-{record.wakeup_count}"
@@ -745,6 +833,10 @@ def reconcile_runs(
             raw_verdict = json.loads(vpath.read_text(encoding="utf-8"))
             verdict = ReviewVerdict.from_dict(raw_verdict)
             results.append(apply_review_verdict(cfg, store, record, verdict, dry_run=dry_run))
+        elif record.status == "pending_merge":
+            res = _advance_pending_merge(cfg, store, record, dry_run=dry_run)
+            if res:
+                results.append(res)
         elif record.status == "verifying_recovery":
             res = _advance_verifying_recovery(cfg, store, record, dry_run=dry_run)
             if res:

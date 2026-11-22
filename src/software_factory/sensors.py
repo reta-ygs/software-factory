@@ -323,11 +323,12 @@ def _collect_efficiency_audit(
     repo_policy: dict[str, Any],
     sensor: dict[str, Any],
     state_dir: Path,
+    *,
+    dry_run: bool = False,
 ) -> list[Signal]:
     repo = repo_policy["repo"]
     interval_hours = float(sensor.get("intervalHours") or 168)  # default weekly
     marker_dir = state_dir / "sensor-state"
-    marker_dir.mkdir(parents=True, exist_ok=True)
     safe_repo = repo.replace("/", "__")
     marker = marker_dir / f"efficiency-audit-{safe_repo}.ts"
     now = time.time()
@@ -338,7 +339,9 @@ def _collect_efficiency_audit(
                 return []
         except ValueError:
             pass
-    marker.write_text(str(now), encoding="utf-8")
+    if not dry_run:
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(now), encoding="utf-8")
     week_tag = time.strftime("%Y-W%W", time.gmtime(now))
     return [
         Signal.from_dict(
@@ -362,7 +365,12 @@ def _collect_efficiency_audit(
     ]
 
 
-def collect_repo_signals(repo_policy: dict[str, Any], state_dir: Path) -> list[Signal]:
+def collect_repo_signals(
+    repo_policy: dict[str, Any],
+    state_dir: Path,
+    *,
+    dry_run: bool = False,
+) -> list[Signal]:
     signals: list[Signal] = []
     for sensor in repo_policy.get("sensors", []):
         if not isinstance(sensor, dict) or sensor.get("enabled", True) is False:
@@ -375,5 +383,5 @@ def collect_repo_signals(repo_policy: dict[str, Any], state_dir: Path) -> list[S
         elif s_type == "command":
             signals.extend(_collect_command_sensor(repo_policy, sensor))
         elif s_type == "efficiency-audit":
-            signals.extend(_collect_efficiency_audit(repo_policy, sensor, state_dir))
+            signals.extend(_collect_efficiency_audit(repo_policy, sensor, state_dir, dry_run=dry_run))
     return signals
