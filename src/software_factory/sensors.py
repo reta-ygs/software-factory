@@ -99,6 +99,11 @@ def fetch_recovery_status(cfg: dict[str, Any], query_url: str) -> dict[str, Any]
     return data
 
 
+VALID_ACK_STATUSES = frozenset(
+    {"dismissed", "auto_merged", "human_review", "resolved", "recovery_failed"}
+)
+
+
 def ack_cloudflare_signal(
     cfg: dict[str, Any],
     signal_dict: dict[str, Any],
@@ -109,6 +114,8 @@ def ack_cloudflare_signal(
     reason: str | None = None,
 ) -> bool:
     """Send status acknowledgment back to the Cloudflare Signal Queue."""
+    if status not in VALID_ACK_STATUSES:
+        raise ValueError(f"Unsupported signal queue ack status: {status!r}")
     ack_url = signal_dict.get("ackUrl")
     if not ack_url:
         return False

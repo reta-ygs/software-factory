@@ -18,7 +18,7 @@ from software_factory.cli import main
 from software_factory.config import DEFAULT_CONFIG, choose_reviewer_agent, load_cf_access_headers
 from software_factory.models import DiffStat
 from software_factory.risk import evaluate_risk, parse_git_numstat
-from software_factory.sensors import fetch_cloudflare_query
+from software_factory.sensors import VALID_ACK_STATUSES, fetch_cloudflare_query
 
 
 class RiskEvaluationTests(unittest.TestCase):
@@ -266,7 +266,13 @@ exit 0
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", "0"))
-                acks.append(json.loads(self.rfile.read(length).decode()))
+                payload = json.loads(self.rfile.read(length).decode())
+                if payload.get("status") not in VALID_ACK_STATUSES:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"invalid status"}')
+                    return
+                acks.append(payload)
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
@@ -387,12 +393,14 @@ exit 0
             )
             rec_merge = self._run_cli("reconcile")
             self.assertEqual(rec_merge["actions"][0]["action"], "pending_merge")
+            self.assertEqual(acks, [])
 
-            # While PR is still OPEN (waiting on CI), reconcile must NOT start recovery check
+            # While PR is still OPEN (waiting on CI), reconcile must NOT start recovery check or ack
             os.environ["MOCK_GH_PR_VIEW"] = '{"state":"OPEN","mergedAt":null}'
             rec_wait = self._run_cli("reconcile")
             self.assertEqual(rec_wait["actions"], [])
             self.assertEqual(self._run_cli("status", run_id)["status"], "pending_merge")
+            self.assertEqual(acks, [])
 
             # 6. Once GitHub confirms MERGED with mergedAt, transition to verifying_recovery
             os.environ["MOCK_GH_PR_VIEW"] = '{"state":"MERGED","mergedAt":"2026-11-22T00:00:00Z"}'
@@ -616,6 +624,95 @@ exit 0
         live = self._run_cli("patrol")
         self.assertEqual(live["signalsFound"], 1)
         self.assertEqual(live["results"][0]["action"], "investigating")
+
+    def test_closed_pending_merge_pr_acks_dismissed_to_strict_queue(self):
+        acks: list[dict] = []
+        rejected: list[dict] = []
+        signal_payload = {
+            "signals": [
+                {
+                    "schemaVersion": 1,
+                    "id": "sig-close-1",
+                    "source": "open-observability-framework",
+                    "repo": "reta-ygs/demo",
+                    "kind": "security",
+                    "severity": "medium",
+                    "title": "Bump dep",
+                    "summary": "Minor security fix",
+                    "dedupeKey": "oof:demo:close-test",
+                }
+            ]
+        }
+
+        class StrictHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(signal_payload).encode())
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode())
+                if payload.get("status") not in VALID_ACK_STATUSES:
+                    rejected.append(payload)
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                acks.append(payload)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StrictHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            self._run_cli("init", "--signal-queue-endpoint", f"http://127.0.0.1:{port}")
+            self._run_cli("repo", "add", "reta-ygs/demo", "--git-url", str(self.bare_repo), "--auto-merge")
+
+            patrol = self._run_cli("patrol")
+            run_id = patrol["results"][0]["runId"]
+            run_detail = self._run_cli("status", run_id)
+            workdir = Path(run_detail["workdir"])
+            self._git(workdir, "config", "user.name", "Worker")
+            self._git(workdir, "config", "user.email", "worker@example.com")
+            self._git(workdir, "config", "commit.gpgsign", "false")
+            (workdir / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            self._git(workdir, "add", "app.py")
+            self._git(workdir, "commit", "-m", "fix")
+            self._git(workdir, "push", "-u", "origin", run_detail["branch"])
+
+            os.environ["MOCK_GH_PR_LIST"] = json.dumps(
+                [{"number": 55, "url": "https://github.com/reta-ygs/demo/pull/55", "baseRefName": "main", "headRefName": run_detail["branch"]}]
+            )
+            self._run_cli("reconcile")
+            run_detail = self._run_cli("status", run_id)
+            Path(run_detail["verdict_path"]).write_text(
+                json.dumps({"schemaVersion": 1, "verdict": "approve", "behaviorImpact": "low", "summary": "OK", "findings": []}),
+                encoding="utf-8",
+            )
+            rec_pending = self._run_cli("reconcile")
+            self.assertEqual(rec_pending["actions"][0]["action"], "pending_merge")
+            self.assertEqual(acks, [])
+            self.assertEqual(rejected, [])
+
+            # Maintainer closes PR unmerged -> queue receives valid 'dismissed' ack
+            os.environ["MOCK_GH_PR_VIEW"] = '{"state":"CLOSED","mergedAt":null}'
+            rec_closed = self._run_cli("reconcile")
+            self.assertEqual(rec_closed["actions"][0]["action"], "closed")
+            self.assertEqual(rejected, [])
+            self.assertEqual(len(acks), 1)
+            self.assertEqual(acks[0]["status"], "dismissed")
+            self.assertTrue(self._run_cli("status", run_id)["signal_acked"])
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

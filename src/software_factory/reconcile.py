@@ -609,7 +609,8 @@ def apply_review_verdict(
 
     record.risk_report = risk_report.to_dict()
     record.review_verdict = verdict.to_dict()
-    _maybe_ack(cfg, record, status=record.status, reason=record.decision_reason)
+    if record.status == "human_review":
+        _maybe_ack(cfg, record, status="human_review", reason=record.decision_reason)
     store.save_run(record)
     return {
         "action": record.status,
@@ -640,7 +641,7 @@ def _advance_pending_merge(
             return {"action": "dry-run-closed", "runId": record.run_id}
         record.status = "closed"
         record.decision_reason = "PR was closed without merging."
-        _maybe_ack(cfg, record, status="closed", reason=record.decision_reason, force=True)
+        _maybe_ack(cfg, record, status="dismissed", reason=record.decision_reason, force=True)
         store.save_run(record)
         return {"action": "closed", "runId": record.run_id}
     if state != "MERGED":
